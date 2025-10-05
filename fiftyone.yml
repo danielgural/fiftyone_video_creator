@@ -1,0 +1,9 @@
+name: "@fiftyone_video_creator/fiftyone_video_creator"
+description: Create video assets from grouped datasets by stitching frame sequences per scene and sensor
+version: 1.0.0
+fiftyone:
+  version: "*"
+url: https://github.com/danielgural/fiftyone_video_creator
+license: Apache 2.0
+operators:
+  - create_video_assets_per_scene
