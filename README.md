@@ -12,9 +12,34 @@ This plugin provides functionality to create video assets from grouped datasets 
 
 ## Installation
 
-1. Copy this plugin to your FiftyOne plugins directory
-2. Ensure ffmpeg is installed on your system
-3. The plugin will be automatically loaded by FiftyOne
+### Prerequisites
+
+1. Install FiftyOne (if you haven't already):
+   ```shell
+   pip install fiftyone
+   ```
+
+2. Ensure `ffmpeg` is installed on your system:
+   ```shell
+   # Ubuntu/Debian
+   sudo apt-get install ffmpeg
+
+   # macOS
+   brew install ffmpeg
+
+   # Windows
+   # Download from https://ffmpeg.org/download.html
+   ```
+
+### Install the Plugin
+
+Install the plugin directly from GitHub:
+
+```shell
+fiftyone plugins download https://github.com/danielgural/fiftyone_video_creator
+```
+
+The plugin will be automatically loaded by FiftyOne.
 
 ## Usage
 
