@@ -8,120 +8,234 @@ by stitching together frame sequences per scene and sensor.
 |
 """
 
-import fiftyone as fo
-import fiftyone.operators as foo
-import fiftyone.operators.types as types
 import os
 import subprocess
 import tempfile
 from pathlib import Path
+import math
+from statistics import median
+from datetime import datetime
+
+import fiftyone as fo
+import fiftyone.operators as foo
+import fiftyone.operators.types as types
 
 
-def get_frame_paths(scene, use_generated=False, target_sensors=None):
+# ------------------------------
+# Frame extraction
+# ------------------------------
+def get_frame_paths(scene_view, use_generated=False, target_sensors=None, dataset=None):
     """
-    Extract frame paths from a scene for specified camera sensors.
-    
+    Extract frame paths from a scene for specified camera sensors without
+    mutating global state (no group_slice changes).
+
     Args:
-        scene: FiftyOne scene group containing sensor samples
-        use_generated (bool): Whether to use generated images (default: False)
-        target_sensors (list): List of sensor names to process (default: None = all camera sensors)
-    
+        scene_view: FiftyOne view for a single scene (dynamic group)
+        use_generated (bool): Whether to prefer generated images if flagged
+        target_sensors (list[str] | None): Subset of sensors to include
+        dataset: Original dataset to get group_media_types from
+
     Returns:
-        dict: Dictionary mapping sensor names to lists of frame file paths
+        dict[str, list[str]]: {sensor_name: [frame_filepaths]}
     """
-    # Get all sensors in the scene and filter for camera sensors only
-    scene_sensors = scene.group_media_types
-    camera_sensors = [sensor_name for sensor_name, sensor_type in scene_sensors.items() if "image" == sensor_type]
+    # Discover sensors in this scene; keep camera slices only
+    # Use dataset group_media_types if scene_view doesn't have it
+    if dataset is not None:
+        scene_sensors = dataset.group_media_types
+    else:
+        scene_sensors = getattr(scene_view, "group_media_types", {})
+        if scene_sensors is None:
+            scene_sensors = {}
     
-    # Filter to target sensors if specified
-    if target_sensors is not None:
-        camera_sensors = [sensor for sensor in camera_sensors if sensor in target_sensors]
+    camera_sensors = [n for n, t in scene_sensors.items() if t == "image"]
+
+    if target_sensors:
+        camera_sensors = [s for s in camera_sensors if s in target_sensors]
         print(f"  - Filtering to target sensors: {camera_sensors}")
-    
+
     frames_dict = {}
+
     for sensor_name in camera_sensors:
         print(f"  - Processing sensor: {sensor_name}")
-        
-        # Set the group slice to the current sensor
-        scene.group_slice = sensor_name
-        frame_paths = []
-        
-        # Get the first sample to check metadata
-        sample = scene.first()
-        
-        # Check if we should use generated images
-        if "generated" in sample.field_names and sample["generated"] == True and use_generated:
-            print(f"    Using generated images for {sensor_name}")
-            frame_paths = scene.values("filepath")
-        elif "generated" not in sample.field_names or sample["generated"] == False:
-            print(f"    Using original images for {sensor_name}")
-            frame_paths = scene.values("filepath")
-        else:
-            print(f"    Skipping sensor: {sensor_name} - generated: {sample['generated']}")
+        # Filter samples by group name directly since scene_view doesn't have groups
+        sensor_samples = [s for s in scene_view if hasattr(s, 'group') and s.group and s.group.name == sensor_name]
+
+        if not sensor_samples:
+            print(f"    No samples found for {sensor_name}")
             continue
-        
-        if len(frame_paths) > 0:
+            
+        first = sensor_samples[0]
+        # If you actually store generated frames in a different field,
+        # switch `fp_field` here (e.g., "generated_filepath")
+        use_gen_flag = ("generated" in first.field_names) and bool(first["generated"])
+        using_generated = use_generated and use_gen_flag
+        fp_field = "filepath"  # change here if you keep generated in a different field
+
+        frame_paths = [s[fp_field] for s in sensor_samples]
+
+        if frame_paths:
             frames_dict[sensor_name] = frame_paths
-            print(f"    Found {len(frame_paths)} frames for {sensor_name}")
+            print(
+                f"    Found {len(frame_paths)} frames for {sensor_name} "
+                f"({'generated' if using_generated else 'original'})"
+            )
         else:
             print(f"    No frames found for {sensor_name}")
-        
+
     return frames_dict
 
 
+# ------------------------------
+# FPS calculation
+# ------------------------------
+def calculate_fps_from_timestamps(
+    samples,
+    timestamp_field="timestamp",
+    timestamps_in_seconds=None,  # None=auto-detect, True=seconds, False=microseconds
+    default_fps=30.0,
+    trim_percent=0.10,           # trim 10% of extremes
+):
+    """
+    Calculate FPS from per-frame timestamps.
+
+    Args:
+        samples: Iterable of FiftyOne samples (frames)
+        timestamp_field: Field name (guaranteed to exist on each sample)
+        timestamps_in_seconds: None=auto, True=seconds, False=microseconds
+        default_fps: Fallback FPS
+        trim_percent: Fraction (0..0.49) to trim from each tail
+
+    Returns:
+        float: Estimated FPS
+    """
+    try:
+        ts = []
+        for s in samples:
+            v = s[timestamp_field]  # direct access; field guaranteed
+            if isinstance(v, datetime):
+                v = v.timestamp()  # seconds
+            v = float(v)
+            ts.append(v)
+
+        if len(ts) < 2:
+            return default_fps
+
+        ts.sort()
+        diffs = [b - a for a, b in zip(ts, ts[1:]) if (b - a) > 0]
+        if not diffs:
+            return default_fps
+
+        # Unit detection if unspecified
+        # - seconds: median diff < 1
+        # - milliseconds: 1 <= median diff < 1000
+        # - microseconds: median diff >= 1000
+        if timestamps_in_seconds is None:
+            med = median(diffs)
+            if med < 1.0:
+                units = "seconds"
+                diffs_sec = diffs
+            elif med < 1000.0:
+                units = "milliseconds"
+                diffs_sec = [d / 1_000.0 for d in diffs]
+            else:
+                units = "microseconds"
+                diffs_sec = [d / 1_000_000.0 for d in diffs]
+        else:
+            if timestamps_in_seconds:
+                units = "seconds"
+                diffs_sec = diffs
+            else:
+                units = "microseconds"
+                diffs_sec = [d / 1_000_000.0 for d in diffs]
+
+        diffs_sec.sort()
+        if 0.0 < trim_percent < 0.49 and len(diffs_sec) > 10:
+            k = int(len(diffs_sec) * trim_percent)
+            diffs_sec = diffs_sec[k: len(diffs_sec) - k] or diffs_sec
+
+        gap = median(diffs_sec)
+        if gap <= 0 or math.isinf(gap) or math.isnan(gap):
+            return default_fps
+
+        fps = 1.0 / gap
+        fps = max(1.0, min(240.0, fps))
+
+        print(f"📊 Calculated FPS: {fps:.3f} (median Δ={gap:.6f}s, units={units}, n={len(diffs_sec)})")
+        return fps
+
+    except Exception as e:
+        print(f"⚠️ Failed to calculate FPS from timestamps: {e}")
+        return default_fps
+
+
+# ------------------------------
+# Video creation via ffmpeg
+# ------------------------------
 def create_video_from_frames(frame_paths, output_path, fps=30):
     """
     Create a video from a sequence of frame images using ffmpeg.
-    
+
     Args:
         frame_paths: List of paths to frame images (sorted)
         output_path: Path where the output video will be saved
         fps: Frames per second for the output video
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
     try:
-        # Create a temporary file list for ffmpeg
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            for frame_path in frame_paths:
-                f.write(f"file '{frame_path}'\n")
-            filelist_path = f.name
-        
-        # Use ffmpeg to create video from image sequence
-        cmd = [
-            'ffmpeg',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', filelist_path,
-            '-c:v', 'libx264',
-            '-pix_fmt', 'yuv420p',
-            '-r', str(fps),
-            '-y',  # Overwrite output file
-            output_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # Clean up temporary file
-        os.unlink(filelist_path)
-        
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"FFmpeg error: {result.stderr}")
+        frame_paths = list(frame_paths)
+        if not frame_paths:
+            print("FFmpeg: no frame paths")
             return False
-            
+
+        out_dir = os.path.dirname(output_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Concat demuxer list; escape single quotes
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            for frame_path in frame_paths:
+                sp = str(frame_path).replace("'", r"'\''")
+                f.write(f"file '{sp}'\n")
+            filelist_path = f.name
+
+        # -r before -i controls input frame rate for image sequences when using concat list
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error",
+            "-r", str(fps),
+            "-f", "concat",
+            "-safe", "0",
+            "-i", filelist_path,
+            "-vsync", "vfr",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-y",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        os.unlink(filelist_path)
+
+        if result.returncode != 0:
+            print("FFmpeg error:", (result.stderr or "").strip())
+            return False
+
+        return True
+
     except Exception as e:
         print(f"Error creating video from frames: {e}")
         return False
 
 
+# ------------------------------
+# Operator
+# ------------------------------
 class CreateVideoAssetsPerScene(foo.Operator):
     """
     Create video assets from grouped datasets by stitching together frame sequences per scene and sensor.
     """
-    
+
     @property
     def config(self):
         return foo.OperatorConfig(
@@ -130,53 +244,76 @@ class CreateVideoAssetsPerScene(foo.Operator):
             description="Create video files from frame sequences in grouped datasets",
             dynamic=True,
             execution_options=foo.ExecutionOptions(
-                allow_immediate_execution=False,     # Disable immediate execution
+                allow_immediate_execution=True,      # Enable immediate execution for testing
                 allow_delegated_execution=True,      # Enable delegated execution
                 allow_distributed_execution=True,    # Enable distributed execution
                 default_choice_to_delegated=True,    # Default to delegated execution
             ),
         )
-    
+
     def resolve_delegation(self, ctx):
-        return True
+        # Allow immediate execution for testing
+        return False
 
     def resolve_input(self, ctx):
         inputs = types.Object()
-        
-        # Scene ID field input
+
+        # Build simple field choices for autocomplete (schema keys only)
+        dataset_field_choices = []
+        if getattr(ctx, "dataset", None) is not None:
+            schema = ctx.dataset.get_field_schema()
+            dataset_field_choices = [types.Choice(label=field_name, value=field_name) for field_name in schema.keys()]
+
+        # Scene ID field
         inputs.str(
             "scene_id_field",
             label="Scene ID Field",
             description="Field name containing scene IDs (default: 'scene_id')",
             default="scene_id",
+            view=types.AutocompleteView(choices=dataset_field_choices),
         )
-        
-        # Timestamp field input
+
+        # Timestamp field
         inputs.str(
-            "timestamp_field", 
+            "timestamp_field",
             label="Timestamp Field",
             description="Field name containing timestamps (default: 'timestamp')",
             default="timestamp",
+            view=types.AutocompleteView(choices=dataset_field_choices),
         )
-        
-        # FPS input
+
+        # FPS override option + value (always show for simplicity)
+        inputs.bool(
+            "use_fps_override",
+            label="Override FPS",
+            description="Override automatic FPS calculation based on timestamps",
+            default=False,
+        )
         inputs.int(
             "fps",
-            label="Video FPS",
-            description="Frames per second for output videos",
+            label="Video FPS (Override)",
+            description="Used only if Override FPS is enabled",
             default=30,
             min=1,
-            max=120,
+            max=240,
         )
-        
+
+        # Timestamp units option
+        inputs.bool(
+            "timestamps_in_seconds",
+            label="Timestamps in Seconds",
+            description="Check if timestamps are in seconds (default assumes microseconds)",
+            default=False,
+        )
+
         # Use generated images option
         inputs.bool(
             "use_generated",
             label="Use Generated Images",
-            description="Whether to use generated images if available",
+            description="Whether to prefer generated images if available",
             default=False,
         )
-        
+
         # Target sensors input
         inputs.list(
             "target_sensors",
@@ -185,193 +322,184 @@ class CreateVideoAssetsPerScene(foo.Operator):
             description="List of sensor names to process (leave empty for all camera sensors)",
             default=[],
         )
-        
+
         # Video path field name
         inputs.str(
             "video_path_field",
             label="Video Path Field Name",
             description="Field name to store video paths (default: 'video_path')",
             default="video_path",
+            view=types.AutocompleteView(choices=dataset_field_choices),
         )
-        
+
         return types.Property(inputs)
 
     def execute(self, ctx):
         """Execute the video creation process."""
-        # Get parameters
+        # Params
         scene_id_field = ctx.params.get("scene_id_field", "scene_id")
         timestamp_field = ctx.params.get("timestamp_field", "timestamp")
+        use_fps_override = ctx.params.get("use_fps_override", False)
         fps = ctx.params.get("fps", 30)
+        timestamps_in_seconds = ctx.params.get("timestamps_in_seconds", False)
         use_generated = ctx.params.get("use_generated", False)
-        target_sensors = ctx.params.get("target_sensors", [])
+        target_sensors = ctx.params.get("target_sensors", []) or None
         video_path_field = ctx.params.get("video_path_field", "video_path")
-        
-        # Convert empty list to None for target_sensors
-        if not target_sensors:
-            target_sensors = None
-        
-        # Get the dataset view
+
         dataset = ctx.dataset
         if dataset is None:
             raise ValueError("No dataset found in context")
-        
+
         print(f"Processing dataset: {dataset.name}")
         print(f"Scene ID field: {scene_id_field}")
         print(f"Timestamp field: {timestamp_field}")
-        print(f"FPS: {fps}")
+        print(f"FPS override: {use_fps_override} ({fps} if True)")
+        print(f"Timestamps units: {'seconds' if timestamps_in_seconds else 'microseconds'}")
         print(f"Use generated: {use_generated}")
         print(f"Target sensors: {target_sensors}")
         print(f"Video path field: {video_path_field}")
-        
-        # Process the dataset
+
         results = _process_grouped_dataset(
-            dataset,
+            dataset=dataset,
             scene_id_field=scene_id_field,
             timestamp_field=timestamp_field,
-            fps=fps,
+            fps=fps if use_fps_override else None,
+            use_fps_override=use_fps_override,
+            timestamps_in_seconds=timestamps_in_seconds,
             use_generated=use_generated,
             target_sensors=target_sensors,
-            video_path_field=video_path_field
+            video_path_field=video_path_field,
         )
-        
+
         return results
 
 
-def _process_grouped_dataset(dataset, scene_id_field="scene_id", timestamp_field="timestamp", 
-                           fps=30, use_generated=False, target_sensors=None, video_path_field="video_path"):
+# ------------------------------
+# Core processing
+# ------------------------------
+def _process_grouped_dataset(
+    dataset,
+    scene_id_field="scene_id",
+    timestamp_field="timestamp",
+    fps=None,
+    use_fps_override=False,
+    timestamps_in_seconds=False,
+    use_generated=False,
+    target_sensors=None,
+    video_path_field="video_path",
+):
     """
     Process a grouped dataset by scene_id, creating videos for each sensor/camera.
-    
-    Args:
-        dataset: FiftyOne dataset
-        scene_id_field: Field name containing scene IDs
-        timestamp_field: Field name containing timestamps
-        fps: Frames per second for output videos
-        use_generated: Whether to use generated images
-        target_sensors: List of target sensor names (None for all)
-        video_path_field: Field name to store video paths
-    
+
     Returns:
         dict: Results summary
     """
-    # Create grouped view by scene_id, ordered by timestamp
-    grouped_view = dataset.group_by(scene_id_field, order_by=timestamp_field)
-    
-    print(f"Found {len(grouped_view)} scene groups")
-    print(f"Group view type: {type(grouped_view)}")
-    print(f"Is dynamic groups: {grouped_view._is_dynamic_groups}")
-    
-    # Use the correct iteration method based on group type
-    if grouped_view._is_dynamic_groups:
-        print("Using iter_dynamic_groups() for dynamic group view")
-        group_iterator = grouped_view.iter_dynamic_groups()
+    # Dynamic groups by scene with ordering
+    # First select all image sensor slices to ensure all sensors are included
+    if dataset.media_type == "group":
+        available_media_types = dataset.group_media_types
+        image_sensors = [sensor for sensor, media_type in available_media_types.items() if media_type == "image"]
+        if image_sensors:
+            # Create a view that includes all image sensor slices before grouping
+            all_sensors_view = dataset.select_group_slices(image_sensors)
+            grouped_view = all_sensors_view.group_by(scene_id_field, order_by=timestamp_field)
+        else:
+            grouped_view = dataset.group_by(scene_id_field, order_by=timestamp_field)
     else:
-        print("Using iter_groups() for normal group view")
-        group_iterator = grouped_view.iter_groups()
-    
+        grouped_view = dataset.group_by(scene_id_field, order_by=timestamp_field)
+
+    # Public way to confirm dynamic groups (older FO may not have this; default True)
+    is_dyn = getattr(grouped_view, "outputs_dynamic_groups", lambda: True)()
+    if not is_dyn:
+        raise RuntimeError("Expected a dynamic-groups view from group_by()")
+
+    # Count scene groups for logging
+    n_scenes = sum(1 for _ in grouped_view.iter_dynamic_groups())
+    print(f"Found {n_scenes} scene groups")
+
     total_scenes = 0
     total_videos = 0
     total_samples_updated = 0
-    
-    for scene_view in group_iterator:
+
+    for scene_view in grouped_view.iter_dynamic_groups():
         total_scenes += 1
-        
-        # Get the scene ID from the first sample
-        scene_id = scene_view.first()[scene_id_field]
+
+        first = scene_view.first()
+        scene_id = first[scene_id_field]
         print(f"\nProcessing scene group: {scene_id}")
-        
-        # First, check if videos already exist for this scene before extracting frame paths
-        print(f"  - Checking for existing videos...")
-        
-        # Check if samples already have video_path field set
-        samples_with_video = scene_view.exists(video_path_field)
-        if len(samples_with_video) > 0:
-            print(f"  - Found {len(samples_with_video)} samples with existing video_path field")
-            # Get all unique video paths for this scene
-            existing_video_paths = set()
-            for sample in samples_with_video:
-                if sample.has_field(video_path_field) and sample.get_field(video_path_field):
-                    existing_video_paths.add(sample.get_field(video_path_field))
-            
-            if existing_video_paths:
-                print(f"  - Scene {scene_id} already has videos: {list(existing_video_paths)}")
-                print(f"  - Skipping scene {scene_id} (videos already exist)")
-                total_videos += len(existing_video_paths)
-                continue
-        
-        # Check for existing video files on disk
-        first_sample = list(scene_view)[0]
-        sample_dir = os.path.dirname(first_sample.filepath)
-        
-        # Get all sensors that might have videos
-        all_sensors = set()
-        for sample in scene_view:
-            if sample.has_field("sensor_name"):
-                all_sensors.add(sample.get_field("sensor_name"))
-        
-        existing_videos_on_disk = []
-        for sensor_name in all_sensors:
-            video_output_path = os.path.join(sample_dir, f"scene_{scene_id}_{sensor_name}_generated.mp4")
-            if os.path.exists(video_output_path):
-                existing_videos_on_disk.append((sensor_name, video_output_path))
-        
-        if existing_videos_on_disk:
-            print(f"  - Found {len(existing_videos_on_disk)} existing video files on disk for scene {scene_id}")
-            for sensor_name, video_path in existing_videos_on_disk:
-                print(f"    * {sensor_name}: {video_path}")
-            print(f"  - Skipping scene {scene_id} (videos already exist on disk)")
-            total_videos += len(existing_videos_on_disk)
-            continue
-        
-        # If we get here, no videos exist - proceed with frame extraction and video creation
-        print(f"  - No existing videos found, proceeding with video creation...")
-        
-        # Use the get_frame_paths function to extract frame sequences for all camera sensors
-        print(f"  - Extracting frame paths using get_frame_paths:")
-        frame_sequences = get_frame_paths(scene_view, use_generated=use_generated, target_sensors=target_sensors)
-        
+
+        # Extract per-sensor frame sequences
+        print("  - Extracting frame paths:")
+        frame_sequences = get_frame_paths(
+            scene_view, use_generated=use_generated, target_sensors=target_sensors, dataset=dataset
+        )
         if not frame_sequences:
-            print(f"No frame sequences found for scene {scene_id}, skipping...")
+            print(f"  - No frame sequences found for scene {scene_id}; skipping")
             continue
-        
-        # Create videos for each sensor that has frames
+
         sensor_video_paths = {}
+
+        # Per-sensor processing
         for sensor_name, frame_paths in frame_sequences.items():
             if not frame_paths:
                 continue
-                
-            # Generate output path for this sensor's video
-            video_output_path = os.path.join(sample_dir, f"scene_{scene_id}_{sensor_name}_generated.mp4")
+
+            # Filter samples by group name directly since scene_view doesn't have groups
+            sensor_samples = [s for s in scene_view if hasattr(s, 'group') and s.group and s.group.name == sensor_name]
             
-            # Double-check if video was created between our check and now
-            if os.path.exists(video_output_path):
-                print(f"Video already exists for scene {scene_id}, sensor {sensor_name}: {video_output_path}")
-                sensor_video_paths[sensor_name] = video_output_path
-                total_videos += 1
+            if not sensor_samples:
                 continue
-            
-            print(f"Creating video from {len(frame_paths)} frames for scene {scene_id}, sensor {sensor_name}")
-            success = create_video_from_frames(frame_paths, video_output_path, fps=fps)
-            
-            if success:
+
+            # (a) Field-level: already annotated with a video path?
+            samples_with_videos = [s for s in sensor_samples if s.has_field(video_path_field) and s[video_path_field]]
+            if len(samples_with_videos) == len(sensor_samples):
+                existing_paths = [s[video_path_field] for s in samples_with_videos]
+                if existing_paths:
+                    # Use the first path (assume uniform)
+                    existing = existing_paths[0]
+                    print(f"  - {sensor_name}: video already set in fields → {existing}")
+                    sensor_video_paths[sensor_name] = existing
+                    continue
+
+            # (b) On-disk check (derive dir from first frame)
+            first_frame_dir = os.path.dirname(frame_paths[0])
+            video_output_path = os.path.join(
+                first_frame_dir, f"scene_{scene_id}_{sensor_name}_generated.mp4"
+            )
+            if os.path.exists(video_output_path):
+                print(f"  - {sensor_name}: found existing on disk → {video_output_path}")
+                sensor_video_paths[sensor_name] = video_output_path
+                continue
+
+            # FPS
+            if use_fps_override and fps is not None:
+                video_fps = fps
+            else:
+                video_fps = calculate_fps_from_timestamps(
+                    sensor_samples, timestamp_field, timestamps_in_seconds
+                )
+
+            print(f"  - {sensor_name}: creating video @ {video_fps:.3f} fps → {video_output_path}")
+            ok = create_video_from_frames(frame_paths, video_output_path, fps=video_fps)
+            if ok:
                 sensor_video_paths[sensor_name] = video_output_path
                 total_videos += 1
-                print(f"Successfully created video: {video_output_path}")
+                print(f"    ✓ Created {video_output_path}")
             else:
-                print(f"Failed to create video for scene {scene_id}, sensor {sensor_name}")
-        
-        # Update video_path field for all samples in this scene group
-        samples_updated = 0
-        for sample in scene_view:
-            sensor_name = sample.get_field("sensor_name") if sample.has_field("sensor_name") else "unknown"
-            if sensor_name in sensor_video_paths:
-                sample.set_field(video_path_field, sensor_video_paths[sensor_name])
-                sample.save()
-                samples_updated += 1
-        
-        total_samples_updated += samples_updated
-        print(f"Updated {video_path_field} field for {samples_updated} samples in scene {scene_id}")
-    
+                print(f"    ✗ Failed to create video for {sensor_name}")
+
+        # Write field back per sample for produced sensors
+        updated = 0
+        for s in scene_view:
+            sname = s.group.name  # NOTE: using .name per your environment/version
+            if sname in sensor_video_paths:
+                s.set_field(video_path_field, sensor_video_paths[sname])
+                s.save()
+                updated += 1
+
+        total_samples_updated += updated
+        print(f"  - Updated {video_path_field} for {updated} samples in scene {scene_id}")
+
     results = {
         "total_scenes_processed": total_scenes,
         "total_videos_created": total_videos,
@@ -379,16 +507,17 @@ def _process_grouped_dataset(dataset, scene_id_field="scene_id", timestamp_field
         "scene_id_field": scene_id_field,
         "timestamp_field": timestamp_field,
         "fps": fps,
+        "use_fps_override": use_fps_override,
         "use_generated": use_generated,
         "target_sensors": target_sensors,
         "video_path_field": video_path_field,
     }
-    
-    print(f"\n🎉 Video creation completed!")
+
+    print("\n🎉 Video creation completed!")
     print(f"  - Processed {total_scenes} scenes")
     print(f"  - Created {total_videos} videos")
     print(f"  - Updated {total_samples_updated} samples")
-    
+
     return results
 
 
